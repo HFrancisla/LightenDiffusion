@@ -1,0 +1,40 @@
+# ============================================================
+# LightenDiffusion 第一阶段训练配置
+# 参数来源标注：
+#   [论文]   = 论文 Section 4.1 明确给出
+#   [代码]   = 由原始仓库代码/配置推断
+#   [补充]   = 论文和代码均未明确，由我们合理设定
+# ============================================================
+
+data:
+    type: "SICEDataset"                              # [补充] 数据集类名，对应 datasets/sice_dataset.py
+    train_dataset: "SICE"                            # [论文] "paired low-quality images from the SICE dataset"
+    patch_size: 512                                  # [论文] Section 4.1: "randomly cropped to 512×512"
+    channels: 3                                      # [论文] RGB 3 通道输入
+    num_workers: 4                                   # [补充] 数据加载线程数
+    # SICE 数据集根目录，需包含：
+    #   sice_train.txt  （每行：img1路径 img2路径，同场景不同曝光）
+    #   sice_val.txt    （同上格式）
+    data_dir: "/data/Image_restoration/SICE_dataset" # [补充] 需修改为实际路径
+    ckpt_dir: "ckpt/stage1"                          # [代码] 与 ddm.py 中 load_stage1('ckpt/stage1') 对应
+
+training:
+    batch_size: 12                                   # [论文] Section 4.1: "batch size of 12"（未区分阶段，沿用）
+    n_iters: 100000                                  # [论文] Section 4.1: "1×10^5 iterations"
+    lr: 0.0001                                       # [论文] Section 4.1: "initial learning rate of 1×10^-4"
+    lr_decay_factor: 0.8                             # [论文] Section 4.1: "decays by a factor of 0.8"
+    lr_decay_every: 20000                            # [补充] 论文未指定衰减间隔，设为总迭代的 1/5
+    validation_freq: 2000                            # [补充] 验证频率
+    save_freq: 5000                                  # [补充] 检查点保存频率
+
+loss:
+    lambda_ref: 0.1                                  # [论文] Section 4.1: "λ_ref = 0.1"
+    lambda_ill: 0.01                                 # [论文] Section 4.1: "λ_ill = 0.01"
+    lambda_g: 10.0                                   # [论文] Section 4.1: "λ_g = 10"
+
+optim:
+    weight_decay: 0.000                              # [代码] 沿用 unsupervised.yml 中的设定
+    optimizer: "Adam"                                # [论文] Section 4.1: "Adam optimizer"
+    lr: 0.0001                                       # [论文] Section 4.1: "initial learning rate of 1×10^-4"
+    amsgrad: False                                   # [代码] 沿用 unsupervised.yml 中的设定
+    eps: 0.00000001                                  # [代码] 沿用 unsupervised.yml 中的设定（1e-8）
