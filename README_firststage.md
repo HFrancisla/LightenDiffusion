@@ -20,8 +20,15 @@
 
 - **SICE 数据集的配对方式**：论文仅说"paired low-quality images from SICE"，具体如何从多曝光序列中组成配对（随机选取两张不同曝光？固定选最暗和最亮？）**未明确说明**，我们实现为任意两张不同曝光图像配对
 - **L_con 的具体实现路径**：论文给出公式 `||I - D(E(I))||_2`，但编码器产出的潜在特征如何经过解码器重建回原图的数据流（是否使用 skip connection、是否用 `channel_up`），是根据 `ReconNet` 代码中 `pred_fea` 分支的逻辑推断的
+- **L_con 对几张图像计算**：论文 Eq.7 写 `||I - D(E(I))||_2`，未说明是对配对中的两张图都计算还是只对其中一张。我们实现为只对 img1 计算，原因：① 解码器权重共享，单图梯度已能充分训练重建能力；② 每次解码需重新运行 `feature_pyramid` 获取跳跃连接，在 512×512 下每次约占 batch×750MB 激活显存，双图重建会导致 4 次 pyramid 调用，12GB 显存无法承受
 - **学习率衰减策略**：论文说"decays by a factor of 0.8"，但未说明衰减间隔和方式（StepLR？每 N 步？），我们设定为每 20000 步衰减一次
-- **batch size**：论文提到 batch_size=12，但未明确是否第一阶段和第二阶段相同，我们沿用了相同值
+- **batch size 与显存约束**：论文提到 batch_size=12，但未区分阶段。第一阶段显存需求远高于第二阶段（第二阶段冻结 CTDN，不保存激活），具体分析：
+  > **显存估算**：`feature_pyramid` 在 512×512 下每次调用约保存 7 个 `[B,64,512,512]` 级张量用于反向传播，单次约 B×750MB。第一阶段 `compute_losses` 共 3 次 pyramid 调用（编码 2 次 + 解码跳跃连接 1 次），激活显存约 3×B×750MB。  
+  > - batch=12: 约 27GB 激活 + 2GB 其他 ≈ **29GB**（需 32GB+ GPU）  
+  > - batch=4: 约 9GB 激活 + 2GB 其他 ≈ **11GB**（适合 12GB GPU）  
+  > - batch=2: 约 4.5GB 激活 + 2GB 其他 ≈ **6.5GB**（适合 8GB GPU）  
+  >
+  > 我们默认设为 batch=4，适配 12GB 显存。如有更大显存可自行调大
 - **patch size 与数据增强**：论文提到 512×512，但未说明是否第一阶段也使用随机裁剪和翻转，我们参照第二阶段的增强策略补充
 - **验证集划分**：论文未提供 SICE 数据集的 train/val 划分方式，需要用户自行划分
 - **验证脚本 `evaluate_stage1.py`**：完全由我们补充，论文和原始仓库均无相关内容
@@ -62,7 +69,7 @@
 | 损失 | 公式 | 作用 |
 |------|------|------|
 | **L_con**（Eq.7） | `\|\| I - D(E(I)) \|\|_2` | 编码器-解码器重建保真度 |
-| **L_rec**（Eq.8） | `\|\| F_j - R_i ⊙ L_j \|\|_1` | 分解后的 R、L 能重建原始特征 |
+| **L_rec**（Eq.8） | `Σ_i Σ_j \|\| F_j - R_i ⊙ L_j \|\|_1` | 分解后的 R、L 能重建原始特征（i,j∈1,2，共 4 项） |
 | **L_ref**（Eq.9） | `\|\| R_1 - R_2 \|\|_1` | 同一场景不同曝光下反射率一致性 |
 | **L_ill**（Eq.9） | `\|\| ∇L · exp(-λ_g · ∇R) \|\|_2` | 光照图局部平滑（边缘感知） |
 
@@ -108,7 +115,7 @@
 |------|--------|------|
 | `data.data_dir` | `/data/Image_restoration/SICE_dataset` | SICE 数据集根目录 |
 | `data.patch_size` | 512 | 训练裁剪尺寸 |
-| `training.batch_size` | 12 | 批量大小 |
+| `training.batch_size` | 4 | 批量大小（论文为 12，因显存约束调为 4，详见上方说明） |
 | `training.n_iters` | 100000 | 总训练迭代次数 |
 | `optim.lr` | 1e-4 | 初始学习率 |
 | `training.lr_decay_factor` | 0.8 | 学习率衰减系数 |
@@ -141,7 +148,7 @@ ckpt/stage1/
 ```
 
 - `stage1_weight.pth.tar`：格式为 `{'model': state_dict}`，可直接被第二阶段的 `load_stage1()` 方法加载
-- `model_step_*.pth.tar` / `model_final.pth.tar`：格式为 `{'step', 'state_dict', 'optimizer'}`，用于恢复第一阶段训练
+- `model_step_*.pth.tar` / `model_final.pth.tar`：格式为 `{'step', 'state_dict', 'optimizer', 'scheduler'}`，用于恢复第一阶段训练
 
 ## 验证分解效果
 

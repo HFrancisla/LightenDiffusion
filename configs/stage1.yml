@@ -19,7 +19,8 @@ data:
     ckpt_dir: "ckpt/stage1"                          # [代码] 与 ddm.py 中 load_stage1('ckpt/stage1') 对应
 
 training:
-    batch_size: 12                                   # [论文] Section 4.1: "batch size of 12"（未区分阶段，沿用）
+    batch_size: 4                                    # [论文] batch_size=12，但第一阶段 3 次 pyramid 前向传播
+                                                     # 显存需求远高于第二阶段（冻结 CTDN），12GB 显存建议 batch=4
     n_iters: 100000                                  # [论文] Section 4.1: "1×10^5 iterations"
     lr: 0.0001                                       # [论文] Section 4.1: "initial learning rate of 1×10^-4"
     lr_decay_factor: 0.8                             # [论文] Section 4.1: "decays by a factor of 0.8"

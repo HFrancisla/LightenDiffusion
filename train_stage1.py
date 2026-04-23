@@ -107,7 +107,14 @@ class Stage1Trainer:
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.step = checkpoint["step"]
-        print("=> loaded checkpoint '{}' (step {})".format(path, self.step))
+        if "scheduler" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler"])
+        else:
+            # 兼容旧检查点：手动推进 scheduler 到正确位置
+            for _ in range(self.step):
+                self.scheduler.step()
+        print("=> loaded checkpoint '{}' (step {}, lr={:.6f})".format(
+            path, self.step, self.optimizer.param_groups[0]["lr"]))
 
     def save_checkpoint(self, filename):
         """保存检查点，兼容第二阶段加载格式。"""
@@ -117,6 +124,7 @@ class Stage1Trainer:
                 "step": self.step,
                 "state_dict": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
             },
             filename=os.path.join(self.config.data.ckpt_dir, filename),
         )
@@ -166,6 +174,13 @@ class Stage1Trainer:
 
         返回:
             loss_dict: 包含所有损失值的字典
+
+        显存分析:
+            feature_pyramid 在 512×512 下每次调用保存 ~7 个 [B,64,512,512] 级
+            激活张量用于反向传播，每次约 B×750MB。本方法共执行 3 次 pyramid 调用：
+              - 第 1 次前向 (pred_fea=None): pyramid(img1) + pyramid(img2) = 2 次
+              - 第 2 次前向 (pred_fea=fea1): pyramid(img1) 用于解码跳跃连接 = 1 次
+            总计 ~3 × B × 750MB 激活。batch=4 时约 9GB，加上模型/优化器 ~11GB。
         """
         lambda_ref = self.config.loss.lambda_ref
         lambda_ill = self.config.loss.lambda_ill
@@ -182,31 +197,30 @@ class Stage1Trainer:
         R2, L2 = output["high_R"], output["high_L"]
 
         # ==================== 内容重建损失 (Eq.7) ====================
-        # L_con = Σ || I_i - D(E(I_i)) ||_2
+        # L_con = || I - D(E(I)) ||_2
         #
-        # ⚠️ 实现说明（推测部分，论文未详述）：
-        # 论文只给出公式 ||I - D(E(I))||_2，但未说明 D(E(·)) 的具体数据流。
-        # 根据 ReconNet 代码 (decom.py L172-186)，解码路径的实际工作方式为：
-        #   1. 将 pred_fea (3ch) 通过 channel_up 还原为高维特征
+        # 论文只给出公式 ||I - D(E(I))||_2，D(E(·)) 的具体数据流根据
+        # ReconNet 代码 (decom.py L161-186) 推断：
+        #   1. 将 pred_fea (3ch) 通过 channel_up 还原为 256ch 高维特征
         #   2. 重新运行 pyramid(I) 获取 down2/down4/down8 的跳跃连接特征
         #   3. 将 channel_up(pred_fea) 与跳跃连接逐级相加并上采样
         #
-        # 潜在风险：由于解码器可通过跳跃连接直接获取原图的多尺度特征，
-        # L_con 可能过于容易满足——即使瓶颈层 (3ch latent) 编码质量差，
-        # 跳跃连接也能弥补重建损失。这意味着 L_con 对瓶颈层表征的约束可能较弱，
-        # Retinex 分解质量将主要依赖 L_rec、L_ref、L_ill 三个分解损失。
+        # 注意：由于解码器经由跳跃连接可直接获取原图的多尺度特征，
+        # L_con 对瓶颈层 (3ch latent) 的约束可能较弱；分解质量主要
+        # 依赖 L_rec、L_ref、L_ill 三个分解损失。但此解码路径与第二阶段
+        # 推理时一致，必须沿用以保持架构兼容。
         #
-        # 但这是 ReconNet 唯一可用的解码路径，且该架构（类 U-Net 跳跃连接）
-        # 在第二阶段推理时也用于从扩散模型预测的潜在特征重建增强图像，
-        # 因此此处必须沿用相同路径以保持一致。
+        # 显存优化：只对 img1 计算 L_con（省去 1 次 pyramid 前向传播）。
+        # feature_pyramid 在 512×512 全分辨率下运行，每次调用约占
+        # batch×750MB 的激活显存。编码器/解码器权重共享，单图梯度
+        # 已能充分训练重建能力。
         #
-        # CTDN.forward 在 pred_fea 非空时使用 images[:, :3, ...] 提供跳跃连接
-        img1_6ch = torch.cat([img1, img1], dim=1)  # 前3通道 = img1，用于跳跃连接
-        img2_6ch = torch.cat([img2, img2], dim=1)  # 前3通道 = img2，用于跳跃连接
-        recon1 = self.model(img1_6ch, pred_fea=fea1)["pred_img"]
-        recon2 = self.model(img2_6ch, pred_fea=fea2)["pred_img"]
-
-        loss_con = self.l2_loss(recon1, img1) + self.l2_loss(recon2, img2)
+        # CTDN.forward 在 pred_fea 非空时只使用 images[:, :3] 提供跳跃
+        # 连接，后 3 通道被忽略，此处传入任意 6ch 即可。
+        recon1 = self.model(
+            torch.cat([img1, img1], dim=1), pred_fea=fea1
+        )["pred_img"]
+        loss_con = self.l2_loss(recon1, img1)
 
         # ==================== 分解损失 ====================
         # Retinex 重建损失 (Eq.8):
@@ -243,12 +257,35 @@ class Stage1Trainer:
             "dec": loss_dec,
         }
 
+    @torch.no_grad()
+    def validate(self, val_loader):
+        """在验证集上评估分解质量。"""
+        self.model.eval()
+        r_consistency_sum, l_std_sum = 0., 0.
+        n = 0
+
+        for x, _ in val_loader:
+            x = x.to(self.device)
+            img1, img2 = x[:, :3, ...], x[:, 3:, ...]
+
+            images_cat = torch.cat([img1, img2], dim=1)
+            output = self.model(images_cat, pred_fea=None)
+            R1, R2 = output["low_R"], output["high_R"]
+            L1, L2 = output["low_L"], output["high_L"]
+
+            r_consistency_sum += torch.mean(torch.abs(R1 - R2)).item()
+            l_std_sum += (torch.std(L1).item() + torch.std(L2).item()) / 2.0
+            n += 1
+
+        if n > 0:
+            print("[Val step {}] R_consistency: {:.6f}, L_std: {:.6f}".format(
+                self.step, r_consistency_sum / n, l_std_sum / n))
+
+        self.model.train()
+
     def train(self, dataset):
         cudnn.benchmark = True
         train_loader, val_loader = dataset.get_loaders()
-
-        if os.path.isfile(getattr(self.config, "resume", "")):
-            self.load_checkpoint(self.config.resume)
 
         n_iters = self.config.training.n_iters
         print("Starting Stage 1 training for {} iterations...".format(n_iters))
@@ -298,6 +335,10 @@ class Stage1Trainer:
                         )
                     )
                     data_start = time.time()
+
+                # 验证
+                if self.step % self.config.training.validation_freq == 0:
+                    self.validate(val_loader)
 
                 # 保存检查点
                 if self.step % self.config.training.save_freq == 0:
