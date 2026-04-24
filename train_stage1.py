@@ -177,11 +177,13 @@ class Stage1Trainer:
 
         显存分析:
             feature_pyramid 在 512×512 下每次调用保存 ~7 个 [B,64,512,512] 级
-            激活张量用于反向传播，每次约 B×750MB。本方法共执行 3 次 pyramid 调用：
+            激活张量用于反向传播，每次约 B×750MB。本方法共执行 4 次 pyramid 调用：
               - 第 1 次前向 (pred_fea=None): pyramid(img1) + pyramid(img2) = 2 次
               - 第 2 次前向 (pred_fea=fea1): pyramid(img1) 用于解码跳跃连接 = 1 次
-            总计 ~3 × B × 750MB 激活。batch=4 时约 9GB，加上模型/优化器 ~11GB。
+              - 第 3 次前向 (pred_fea=fea2): pyramid(img2) 用于解码跳跃连接 = 1 次
+            总计 ~4 × B × 750MB 激活。batch=4 时约 12GB，加上模型/优化器 ~14GB。
         """
+        lambda_con = self.config.loss.lambda_con
         lambda_ref = self.config.loss.lambda_ref
         lambda_ill = self.config.loss.lambda_ill
         lambda_g = self.config.loss.lambda_g
@@ -197,30 +199,22 @@ class Stage1Trainer:
         R2, L2 = output["high_R"], output["high_L"]
 
         # ==================== 内容重建损失 (Eq.7) ====================
-        # L_con = || I - D(E(I)) ||_2
+        # L_con = Σ_{i=1}^{2} || I_i - D(E(I_i)) ||_2
         #
-        # 论文只给出公式 ||I - D(E(I))||_2，D(E(·)) 的具体数据流根据
-        # ReconNet 代码 (decom.py L161-186) 推断：
+        # D(E(·)) 的具体数据流根据 ReconNet 代码 (decom.py L161-186) 推断：
         #   1. 将 pred_fea (3ch) 通过 channel_up 还原为 256ch 高维特征
         #   2. 重新运行 pyramid(I) 获取 down2/down4/down8 的跳跃连接特征
         #   3. 将 channel_up(pred_fea) 与跳跃连接逐级相加并上采样
-        #
-        # 注意：由于解码器经由跳跃连接可直接获取原图的多尺度特征，
-        # L_con 对瓶颈层 (3ch latent) 的约束可能较弱；分解质量主要
-        # 依赖 L_rec、L_ref、L_ill 三个分解损失。但此解码路径与第二阶段
-        # 推理时一致，必须沿用以保持架构兼容。
-        #
-        # 显存优化：只对 img1 计算 L_con（省去 1 次 pyramid 前向传播）。
-        # feature_pyramid 在 512×512 全分辨率下运行，每次调用约占
-        # batch×750MB 的激活显存。编码器/解码器权重共享，单图梯度
-        # 已能充分训练重建能力。
         #
         # CTDN.forward 在 pred_fea 非空时只使用 images[:, :3] 提供跳跃
         # 连接，后 3 通道被忽略，此处传入任意 6ch 即可。
         recon1 = self.model(
             torch.cat([img1, img1], dim=1), pred_fea=fea1
         )["pred_img"]
-        loss_con = self.l2_loss(recon1, img1)
+        recon2 = self.model(
+            torch.cat([img2, img2], dim=1), pred_fea=fea2
+        )["pred_img"]
+        loss_con = self.l2_loss(recon1, img1) + self.l2_loss(recon2, img2)
 
         # ==================== 分解损失 ====================
         # Retinex 重建损失 (Eq.8):
@@ -245,8 +239,8 @@ class Stage1Trainer:
         # 总分解损失
         loss_dec = loss_rec + lambda_ref * loss_ref + lambda_ill * loss_ill
 
-        # 第一阶段总损失
-        total_loss = loss_con + loss_dec
+        # 第一阶段总损失: λ_1 * L_con + L_dec
+        total_loss = lambda_con * loss_con + loss_dec
 
         return {
             "total": total_loss,
